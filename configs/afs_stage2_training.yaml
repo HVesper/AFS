@@ -1,0 +1,30 @@
+method:
+  name: afs
+stage:
+  name: afs_training
+model:
+  backend: self_forcing
+  wan_model_path: null
+  self_forcing_checkpoint_path: null
+  train_mode: lora
+self_forcing:
+  config_path: null
+data:
+  stage1_manifest_path: null
+  semantic_cache_root: null
+  gt_video_root: null
+  gt_latent_mode: precomputed
+  gt_latent_cache_root: null
+teacher:
+  type: ema
+  text_condition_mode: chunk_replace
+  use_gt_assisted_visual_cache: true
+  ema_decay: null
+training:
+  shared_prefix_chunks: 1
+  detach_rollout_transition: true
+  dense_velocity_matching: true
+runtime:
+  output_dir: null
+  resume_checkpoint: null
+  mixed_precision: bf16

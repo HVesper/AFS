@@ -41,13 +41,18 @@ def _resolve_video_path(manifest_path: Path, video_value: str) -> Path:
     return video_path
 
 
-def _sample_indices(num_source_frames: int, num_target_frames: int) -> np.ndarray:
+def _sample_indices(
+    num_source_frames: int,
+    num_target_frames: int,
+    source_fps: float,
+    target_fps: float,
+) -> np.ndarray:
     if num_source_frames <= 0:
         raise ValueError("Video contains no frames.")
-    if num_source_frames >= num_target_frames:
-        return np.linspace(0, num_source_frames - 1, num_target_frames).round().astype(np.int64)
-    pad = np.full(num_target_frames - num_source_frames, num_source_frames - 1, dtype=np.int64)
-    return np.concatenate([np.arange(num_source_frames, dtype=np.int64), pad])
+    if source_fps <= 0 or target_fps <= 0:
+        raise ValueError("Source and target FPS must be positive.")
+    indices = np.rint(np.arange(num_target_frames) * source_fps / target_fps).astype(np.int64)
+    return np.minimum(indices, num_source_frames - 1)
 
 
 def _resize_center_crop(frame: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -63,12 +68,21 @@ def _resize_center_crop(frame: np.ndarray, height: int, width: int) -> np.ndarra
     return np.asarray(image, dtype=np.uint8)
 
 
-def _load_video(video_path: Path, num_frames: int, height: int, width: int) -> torch.Tensor:
+def _load_video(
+    video_path: Path,
+    num_frames: int,
+    height: int,
+    width: int,
+    target_fps: float,
+) -> torch.Tensor:
+    metadata = iio.immeta(video_path)
+    raw_source_fps = metadata.get("fps")
+    source_fps = float(raw_source_fps) if raw_source_fps else float(target_fps)
     frames = iio.imread(video_path)
     if frames.ndim != 4 or frames.shape[-1] not in (3, 4):
         raise ValueError(f"Expected video frames [T, H, W, C], got {frames.shape} for {video_path}")
     frames = frames[..., :3]
-    indices = _sample_indices(frames.shape[0], num_frames)
+    indices = _sample_indices(frames.shape[0], num_frames, source_fps, target_fps)
     processed = [_resize_center_crop(frames[i], height=height, width=width) for i in indices]
     array = np.stack(processed, axis=0).astype(np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(0, 3, 1, 2).contiguous()
@@ -89,7 +103,7 @@ def main() -> None:
     parser.add_argument("--num_frames", type=int, default=243)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--fps", type=int, default=16, help="FPS used only for optional preview exports.")
+    parser.add_argument("--fps", type=int, default=16, help="Target sampling and preview FPS.")
     parser.add_argument("--copy_source_mp4", action="store_true", help="Copy source videos beside the .pt tensors.")
     parser.add_argument("--write_preview_mp4", action="store_true", help="Write resized preview mp4 files.")
     parser.add_argument("--overwrite", action="store_true")
@@ -112,7 +126,7 @@ def main() -> None:
         if video_pt_path.exists() and prompt_path.exists() and not args.overwrite:
             continue
 
-        video_tensor = _load_video(video_path, args.num_frames, args.height, args.width)
+        video_tensor = _load_video(video_path, args.num_frames, args.height, args.width, args.fps)
         torch.save(video_tensor, video_pt_path)
         prompt_path.write_text(str(item["prompt"]).strip() + "\n", encoding="utf-8")
 

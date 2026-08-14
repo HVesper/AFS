@@ -13,13 +13,38 @@ does not change the inference path or duplicate the DiT, scheduler, or KV cache.
 - `trainer/afs_trainer.py`: FSDP, optimizer, LoRA, EMA, loss/backward loop.
 - `train.py`: original distributed training entrypoint.
 
-## Stage 1
+## Unified Launch
 
-Run:
+One configuration and command run semantic preprocessing followed by training:
 
 ```bash
-python scripts/afs_stage1_prepare_semantics.py --config configs/afs_stage1_semantics.yaml
+torchrun --nproc_per_node=$NUM_GPUS scripts/afs_train.py --config configs/afs_training.yaml
 ```
+
+For a full cluster bootstrap, edit the small configuration block at the top of
+`run_afs.sh` and run `bash run_afs.sh`. It downloads the selected public model
+and dataset assets, prepares GT latent caches, generates the internal unified
+configuration, and invokes the command above. Hugging Face and preprocessing
+caches support resume after an interrupted run. After successful comparison
+inference, `CLEANUP_AFTER_SUCCESS=true` removes model weights, source/training
+data, and caches while retaining the AFS checkpoint with optimizer/EMA state,
+comparison artifacts, WorldScore prompt metadata, and the timestamped terminal
+log.
+
+The bootstrap dataset is Sekai-Real-Walking-HQ. Its annotations come from the
+`Lixsp11/Sekai` Hugging Face dataset and its exact annotated frame intervals are
+downloaded from the original YouTube sources with `yt-dlp`. The source clips
+are sampled at the configured target FPS without compressing the full annotated
+duration into the shorter AFS training window. Sekai permits non-commercial
+research use only, and the launcher prints that restriction before downloading.
+
+Comparison inference uses two official WorldScore dynamic T2V prompts downloaded
+from the Hugging Face dataset viewer API. At step 300, training saves the
+LoRA/optimizer/EMA state and exits without duplicate periodic generation.
+Standalone inference then runs both prompts through the original Self-Forcing
+model and final AFS Student LoRA with the same seed policy, sampler, resolution,
+frame count, and cache policy. It also runs the two held-out Sekai captions
+through both models. Each model produces four minute-long videos.
 
 The generic JSONL input contains `sample_id`, `video_path`, and
 `global_caption`. `AFSChunkBoundaryResolver` reads `num_frame_per_block` from
@@ -27,11 +52,9 @@ the selected Self-Forcing config, combines it with the configured VAE temporal
 ratio, FPS, and target frame count, and creates the single boundary list used
 for captioning and output indexing.
 
-The intended local-only flow is GT video chunk -> Qwen3-VL English caption ->
-frozen Self-Forcing UMT5 embedding. Caption and encode phases can run
-separately so both large models need not share GPU memory. The Qwen processor
-adapter remains an explicit cluster-version TODO and raises instead of
-fabricating captions.
+The local-only flow is GT video chunk -> Qwen3-VL English caption -> frozen
+Self-Forcing UMT5 embedding. The unified launcher releases Qwen3-VL before it
+loads UMT5, so both large models do not share GPU memory.
 
 Each output manifest record stores captions, boundaries, status/error, and a
 semantic cache path. Each `.safetensors` cache stores:
@@ -44,18 +67,15 @@ semantic cache path. Each `.safetensors` cache stores:
 Manifest updates are atomic per sample. Completed samples can be skipped and
 input records are deterministically sharded with `index % num_shards`.
 
-## Stage 2
-
-Run locally or under torchrun:
-
-```bash
-python scripts/afs_stage2_train.py --config configs/afs_stage2_training.yaml
-torchrun --nproc_per_node=$NUM_GPUS scripts/afs_stage2_train.py --config configs/afs_stage2_training.yaml
-```
+Each distributed rank runs Qwen3-VL-32B and UMT5 on a disjoint sample shard and
+writes a rank-specific manifest. Rank 0 waits for every shard marker, merges
+the manifests in source order, validates every cache, and atomically publishes
+the global readiness marker. A shard failure prevents training from starting
+with incomplete caches.
 
 The launcher validates all local model, checkpoint, manifest, and latent-cache
 paths before constructing `AFSTrainer`. No loader has a remote or random
-fallback. `AFSStage2Dataset` joins complete Stage 1 records to precomputed
+fallback. `AFSTrainingDataset` joins complete semantic preprocessing records to precomputed
 `gt_chunk_latents` and checks that captions, boundaries, embeddings, and
 latents use the same chunk count.
 
@@ -70,9 +90,7 @@ Student/Student LoRA, and EMA updates immediately after optimizer step.
 
 ## Remaining TODOs
 
-- Adapt Qwen3-VL video processor invocation to the cluster's installed local
-  `transformers` version; no caption operation is run in this repository state.
 - Provide local model/checkpoint/data paths and concrete inherited training
-  hyperparameters in both AFS configs.
+  hyperparameters in `configs/afs_training.yaml`.
 - Implement the optional online GT-video VAE dataset adapter. The current
-  Stage 2 path supports precomputed GT latent caches.
+  AFS training path supports precomputed GT latent caches.

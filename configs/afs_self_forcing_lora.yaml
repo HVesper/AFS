@@ -1,0 +1,72 @@
+trainer: afs_training
+distribution_loss: afs_training
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: full
+mixed_precision: true
+gradient_checkpointing: true
+use_text_encoder: false
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  verbose: false
+  init_lora_weights: gaussian
+lora_train_mode: lora
+lora_ema_enabled: true
+ema_start_step: 0
+afs_loss_type: flow
+afs_loss_frames: 240
+afs_max_loss_frames: 240
+afs_loss_start_frame: 3
+afs_loss_step_mode: all
+afs_loss_flag: -1
+afs_shared_flag_per_window: true
+afs_backward_per_chunk: true
+afs_teacher_context_mode: gt_kv
+afs_student_context_mode: generated_kv
+afs_teacher_trajectory_mode: student
+afs_use_relative_sink: true
+afs_teacher_use_future_gt_context: false
+afs_teacher_future_gt_num_chunks: 1
+window_start_override: 0
+seed: 0
+lr: 1.0e-5
+beta1: 0.0
+beta2: 0.999
+batch_size: 1
+gradient_accumulation_steps: 1
+total_batch_size: 1
+max_iters: 300
+log_iters: 1
+save_iters: 300
+max_checkpoints: 0
+afs_eval_interval: 0
+afs_eval_num_samples: 2
+afs_eval_num_frames: 243
+afs_eval_seed: 12345
+afs_eval_fps: 16
+image_or_video_shape: [1, 240, 16, 60, 104]
+negative_prompt: "low quality, blurry, static, distorted, text, watermark"
+independent_first_frame: false
+same_step_across_blocks: true
+last_step_only: false
+context_noise: 0
+causal: true
+streaming_training: true
+slice_last_frames: 21
+max_grad_norm_generator: 10.0

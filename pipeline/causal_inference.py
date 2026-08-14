@@ -58,6 +58,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self,
         noise: torch.Tensor,
         text_prompts: List[str],
+        prompt_embeds: Optional[torch.Tensor] = None,
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
@@ -78,8 +79,10 @@ class CausalInferencePipeline(torch.nn.Module):
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        conditional_dict = self.text_encoder(
-            text_prompts=text_prompts
+        conditional_dict = (
+            {"prompt_embeds": prompt_embeds}
+            if prompt_embeds is not None
+            else self.text_encoder(text_prompts=text_prompts)
         )
 
         if low_memory:

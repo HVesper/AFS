@@ -10,7 +10,8 @@ checkpoints/*
 !checkpoints/.gitkeep
 data/*
 !data/.gitkeep
-logs/
+logs/*
+!logs/.gitkeep
 outputs/
 videos/
 wandb/
@@ -18,3 +19,4 @@ wandb/
 *.pth
 *.ckpt
 *.safetensors
+.afs_runtime_config.yaml

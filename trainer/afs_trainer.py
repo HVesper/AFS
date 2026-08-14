@@ -15,13 +15,16 @@ from torch.distributed.fsdp import (
     FullOptimStateDictConfig,
     FullStateDictConfig,
 )
+from torchvision.io import write_video
+from einops import rearrange
 
 from afs.types import AFSTrainingBatch
 from model import AFSModel, AFSStreamingTrainingModel
 from utils.dataset import InferencePromptEmbedsVideoLMDBDataset, TextDataset, cycle
-from utils.afs_dataset import AFSStage2Dataset
+from utils.afs_dataset import AFSTrainingDataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, launch_distributed_job
 from utils.misc import merge_dict_list, set_seed
+from pipeline.causal_inference import CausalInferencePipeline
 
 
 class AFSTrainer:
@@ -103,6 +106,14 @@ class AFSTrainer:
         self.streaming_model = AFSStreamingTrainingModel(self.model, config)
         self.streaming_active = False
         self.unconditional_dict = None
+        self.eval_interval = int(getattr(config, "afs_eval_interval", 300))
+        self.eval_num_samples = int(getattr(config, "afs_eval_num_samples", 1))
+        self.eval_num_frames = int(getattr(config, "afs_eval_num_frames", 243))
+        self.eval_seed = int(getattr(config, "afs_eval_seed", 12345))
+        self.eval_prompt = None
+        self.eval_prompt_embedding = None
+        if self.eval_interval > 0:
+            self._load_evaluation_prompt()
 
         self.gradient_accumulation_steps = int(getattr(config, "gradient_accumulation_steps", 1))
         self.max_grad_norm_generator = float(getattr(config, "max_grad_norm_generator", 10.0))
@@ -421,15 +432,21 @@ class AFSTrainer:
             print(f"Resumed checkpoint optimizer/state: {checkpoint_path} (step={self.step})")
 
     def _build_dataloader(self):
-        if getattr(self.config, "afs_stage1_manifest_path", None):
+        if getattr(self.config, "afs_semantic_manifest_path", None):
             if getattr(self.config, "gt_latent_mode", "precomputed") != "precomputed":
                 raise NotImplementedError(
                     "AFS gt_latent_mode=online requires the future local video dataset adapter; "
-                    "use precomputed caches for the current Stage 2 entrypoint"
+                    "use precomputed caches for the current AFS training entrypoint"
                 )
-            dataset = AFSStage2Dataset(
-                self.config.afs_stage1_manifest_path,
+            dataset = AFSTrainingDataset(
+                self.config.afs_semantic_manifest_path,
                 self.config.gt_latent_cache_root,
+                split="train",
+            )
+            self.eval_dataset = AFSTrainingDataset(
+                self.config.afs_semantic_manifest_path,
+                self.config.gt_latent_cache_root,
+                split="eval",
             )
         elif getattr(self.config, "streaming_training", True):
             dataset = InferencePromptEmbedsVideoLMDBDataset(
@@ -454,9 +471,82 @@ class AFSTrainer:
             sampler=sampler,
             num_workers=8,
         )
-        self.dataloader = cycle(dataloader)
+        start_epoch = self.step // max(1, len(dataloader))
+        self.dataloader = cycle(dataloader, sampler=sampler, start_epoch=start_epoch)
         if self.is_main_process:
             print(f"DATASET SIZE {len(dataset)}")
+
+    def _load_evaluation_prompt(self):
+        prompt_path = Path(str(getattr(self.config, "afs_eval_prompt_path", ""))).expanduser()
+        cache_path = Path(str(getattr(self.config, "afs_eval_prompt_cache_path", ""))).expanduser()
+        if not prompt_path.is_file() or not cache_path.is_file():
+            raise FileNotFoundError(
+                f"WorldScore evaluation prompt/cache is missing: {prompt_path}, {cache_path}"
+            )
+        self.eval_prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if not self.eval_prompt:
+            raise ValueError(f"WorldScore evaluation prompt is empty: {prompt_path}")
+        from safetensors.torch import load_file
+
+        tensors = load_file(str(cache_path))
+        self.eval_prompt_embedding = tensors["prompt_embedding"]
+        if self.is_main_process:
+            print(f"Loaded WorldScore T2V evaluation prompt: {self.eval_prompt}")
+
+    @torch.no_grad()
+    def _maybe_run_student_evaluation(self):
+        if self.eval_interval <= 0 or self.step == 0 or self.step % self.eval_interval != 0:
+            return
+        if self.eval_num_frames <= 0 or self.eval_num_frames % self.model.num_frame_per_block != 0:
+            raise ValueError("afs_eval_num_frames must be a positive multiple of num_frame_per_block")
+
+        self._set_generator_adapter("student")
+        self.model.eval()
+        # Text is already encoded by semantic preprocessing; Identity prevents a
+        # second UMT5 instance from being loaded for evaluation.
+        evaluation_pipeline = CausalInferencePipeline(
+            self.config,
+            self.device,
+            generator=self.model.generator,
+            text_encoder=torch.nn.Identity(),
+            vae=self.model.vae,
+        )
+        output_dir = Path(self.output_path) / "eval" / f"step_{self.step:06d}"
+        if self.is_main_process:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
+
+        sample_count = max(1, self.eval_num_samples)
+        for sample_index in range(sample_count):
+            prompt_embeds = self.eval_prompt_embedding.unsqueeze(0).to(
+                device=self.device, dtype=self.dtype
+            )
+            generator = torch.Generator(device=self.device).manual_seed(self.eval_seed + sample_index)
+            noise = torch.randn(
+                [1, self.eval_num_frames, 16, 60, 104],
+                generator=generator,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            video = evaluation_pipeline.inference(
+                noise=noise,
+                text_prompts=[self.eval_prompt],
+                prompt_embeds=prompt_embeds,
+            )
+            if self.is_main_process:
+                frames = rearrange(video, "b t c h w -> b t h w c").cpu()
+                frames = (frames * 255.0).round().clamp(0, 255).to(torch.uint8)
+                sample_id = f"worldscore_t2v_{sample_index:03d}"
+                output_path = output_dir / f"{sample_id}.mp4"
+                write_video(str(output_path), frames[0], fps=int(getattr(self.config, "afs_eval_fps", 16)))
+                print(f"[AFS eval] step={self.step} sample={sample_id} output={output_path}")
+            self.model.vae.model.clear_cache()
+        del evaluation_pipeline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if dist.is_initialized():
+            dist.barrier()
 
     def _get_unconditional_dict(self, batch_size, reference_prompt_embeds=None):
         if self.model.text_encoder is None:
@@ -591,7 +681,7 @@ class AFSTrainer:
 
         sample_ids = batch.get("sample_ids", batch.get("sample_id"))
         if sample_ids is None:
-            raise KeyError("AFS Stage 2 batch requires sample_ids")
+            raise KeyError("AFS AFS training batch requires sample_ids")
         training_batch = AFSTrainingBatch(
             sample_ids=list(sample_ids),
             global_text_embeddings=conditional_dict["prompt_embeds"],
@@ -631,7 +721,7 @@ class AFSTrainer:
         loss, logs = self.streaming_model.compute_afs_generator_loss(
             backward_per_chunk=bool(getattr(self.config, "afs_backward_per_chunk", False)),
         )
-        logs["afs/stage2/loss"] = loss.detach()
+        logs["afs/training/loss"] = loss.detach()
         return {"loss": loss, **logs}
 
     def rollout_student_chunk(self, batch, chunk_index, student_cache):
@@ -901,13 +991,16 @@ class AFSTrainer:
                 grad_val = generator_log_dict["generator_grad_norm"].mean().item()
                 print(f"step {self.step} | generator_loss {loss_val:.6f} | generator_grad_norm {grad_val:.6f}")
                 if (not self.disable_wandb) and (self.tb_writer is not None):
-                    self.tb_writer.add_scalar("afs/stage2/loss", loss_val, self.step)
-                    self.tb_writer.add_scalar("afs/stage2/generator_grad_norm", grad_val, self.step)
-                    self.tb_writer.add_scalar("afs/stage2/ema_decay", float(self.config.ema_weight), self.step)
+                    self.tb_writer.add_scalar("afs/training/loss", loss_val, self.step)
+                    self.tb_writer.add_scalar("afs/training/generator_grad_norm", grad_val, self.step)
+                    self.tb_writer.add_scalar("afs/training/ema_decay", float(self.config.ema_weight), self.step)
 
             if (not no_save) and save_iters > 0 and self.step % save_iters == 0:
                 self.save()
+            self._maybe_run_student_evaluation()
 
+        if (not no_save) and save_iters > 0 and self.step % save_iters != 0:
+            self.save()
         if self.is_main_process and self.tb_writer is not None:
             self.tb_writer.close()
 

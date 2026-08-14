@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
@@ -61,28 +62,47 @@ class AFSChunkBoundaryResolver:
 
     def __init__(self, self_forcing_config, target_fps: float, vae_temporal_ratio: int):
         if not bool(self_forcing_config.get("causal", True)):
-            raise ValueError("AFS Stage 1 requires a causal Self-Forcing configuration")
+            raise ValueError("AFS semantic preprocessing requires a causal Self-Forcing configuration")
         self.latent_frames_per_chunk = int(self_forcing_config.num_frame_per_block)
         self.target_fps = float(target_fps)
         self.vae_temporal_ratio = int(vae_temporal_ratio)
         if min(self.latent_frames_per_chunk, self.target_fps, self.vae_temporal_ratio) <= 0:
             raise ValueError("FPS, VAE temporal ratio, and latent chunk size must be positive")
 
-    @property
-    def pixel_frames_per_chunk(self) -> int:
-        return self.latent_frames_per_chunk * self.vae_temporal_ratio
-
     def resolve(self, target_frame_count: int) -> list[AFSChunkBoundary]:
+        target_frame_count = int(target_frame_count)
+        latent_frame_count = 1 + (target_frame_count - 1) // self.vae_temporal_ratio
+        if 1 + (latent_frame_count - 1) * self.vae_temporal_ratio != target_frame_count:
+            raise ValueError(
+                "target_frame_count must follow the causal VAE layout "
+                "1 + (latent_frames - 1) * temporal_ratio"
+            )
+        if latent_frame_count % self.latent_frames_per_chunk != 0:
+            raise ValueError("Causal VAE latent frame count must be divisible by the chunk size")
+
         boundaries = []
-        for index, start in enumerate(range(0, int(target_frame_count), self.pixel_frames_per_chunk)):
-            end_exclusive = min(start + self.pixel_frames_per_chunk, int(target_frame_count))
+        pixel_start = 0
+        for index, latent_start in enumerate(
+            range(0, latent_frame_count, self.latent_frames_per_chunk)
+        ):
+            # The causal VAE consumes one pixel frame for latent 0, then
+            # temporal_ratio pixel frames for every subsequent latent frame.
+            pixel_count = self.latent_frames_per_chunk * self.vae_temporal_ratio
+            if latent_start == 0:
+                pixel_count -= self.vae_temporal_ratio - 1
+            end_exclusive = pixel_start + pixel_count
             boundaries.append(AFSChunkBoundary(
                 chunk_index=index,
-                frame_start=start,
+                frame_start=pixel_start,
                 frame_end=end_exclusive - 1,
-                time_start_sec=start / self.target_fps,
+                time_start_sec=pixel_start / self.target_fps,
                 time_end_sec=end_exclusive / self.target_fps,
             ))
+            pixel_start = end_exclusive
+        if pixel_start != target_frame_count:
+            raise RuntimeError(
+                f"Causal VAE chunk boundaries cover {pixel_start} frames, expected {target_frame_count}"
+            )
         return boundaries
 
 
@@ -97,26 +117,85 @@ class LocalQwen3VLCaptioner:
 
     def load(self):
         try:
+            import torch
             from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
         except ImportError as exc:
-            raise RuntimeError("Stage 1 caption phase requires a local transformers installation with Qwen3-VL support") from exc
+            raise RuntimeError("semantic preprocessing caption phase requires a local transformers installation with Qwen3-VL support") from exc
+        dtype = getattr(torch, str(self.config.dtype), None)
+        if dtype is None:
+            raise ValueError(f"Unsupported qwen3_vl.dtype: {self.config.dtype}")
         self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_path,
             local_files_only=True,
-            dtype=self.config.dtype,
+            dtype=dtype,
             device_map=self.config.device_map,
             attn_implementation=self.config.attn_implementation,
         ).eval()
         self.model.requires_grad_(False)
 
     def caption(self, video_path: Path, boundary: AFSChunkBoundary, global_caption: str) -> str:
-        # TODO(cluster): adapt the local Qwen3-VL processor's exact video input
-        # schema/version here. Boundary values are the single source of truth.
-        raise NotImplementedError(
-            "Qwen3-VL local video processor integration requires the cluster's installed transformers version; "
-            f"requested {video_path}, frames {boundary.frame_start}:{boundary.frame_end + 1}"
+        import torch
+        from torchvision.io import read_video, write_video
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError as exc:
+            raise RuntimeError("Qwen3-VL video captioning requires the local qwen-vl-utils package") from exc
+
+        frames, _, metadata = read_video(
+            str(video_path),
+            start_pts=boundary.time_start_sec,
+            end_pts=boundary.time_end_sec,
+            pts_unit="sec",
+            output_format="THWC",
         )
+        if frames.shape[0] == 0:
+            raise RuntimeError(
+                f"Decoded no frames for chunk {boundary.chunk_index} of {video_path}"
+            )
+        source_fps = float(metadata.get("video_fps") or self.config.video_fps)
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as temporary:
+            write_video(temporary.name, frames, fps=source_fps, video_codec="libx264")
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": temporary.name},
+                    {"type": "text", "text": CHUNK_CAPTION_PROMPT.format(global_caption=global_caption)},
+                ],
+            }]
+            prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            try:
+                image_inputs, video_inputs, video_kwargs = process_vision_info(
+                    messages, return_video_kwargs=True
+                )
+            except TypeError:
+                image_inputs, video_inputs = process_vision_info(messages)
+                video_kwargs = {}
+            inputs = self.processor(
+                text=[prompt],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+                **video_kwargs,
+            )
+            model_device = next(self.model.parameters()).device
+            inputs = inputs.to(model_device)
+            with torch.no_grad():
+                generated = self.model.generate(
+                    **inputs,
+                    max_new_tokens=int(self.config.max_new_tokens),
+                    do_sample=False,
+                )
+            generated = generated[:, inputs.input_ids.shape[1]:]
+            caption = self.processor.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0].strip().replace("\n", " ")
+        if not caption:
+            raise RuntimeError(f"Qwen3-VL returned an empty caption for chunk {boundary.chunk_index}")
+        return caption
 
     def close(self):
         self.model = None
@@ -149,7 +228,7 @@ class SelfForcingUMT5Encoder:
         gc.collect()
 
 
-class AFSStage1SemanticPreprocessor:
+class AFSSemanticPreprocessor:
     def __init__(self, config):
         self.config = config
         sf_config_path = require_local_path(config.self_forcing.config_path, "self_forcing.config_path")
@@ -189,7 +268,13 @@ class AFSStage1SemanticPreprocessor:
         try:
             for record in records:
                 previous = existing.get(record["sample_id"])
-                if previous and previous.get("status") == "complete" and not bool(self.config.runtime.overwrite):
+                expected_boundaries = [asdict(boundary) for boundary in self.boundaries]
+                if (
+                    previous
+                    and previous.get("status") == "complete"
+                    and previous.get("chunk_boundaries") == expected_boundaries
+                    and not bool(self.config.runtime.overwrite)
+                ):
                     continue
                 result = self._caption_record(record, captioner, previous) if phase != "encode" else dict(previous or record)
                 existing[record["sample_id"]] = result
@@ -240,7 +325,7 @@ class AFSStage1SemanticPreprocessor:
                     try:
                         from safetensors.torch import save_file
                     except ImportError as exc:
-                        raise RuntimeError("safetensors is required to write Stage 1 embedding caches") from exc
+                        raise RuntimeError("safetensors is required to write semantic preprocessing embedding caches") from exc
                     save_file({
                         "global_text_embedding": embeddings[0],
                         "global_text_mask": masks[0],
@@ -251,5 +336,34 @@ class AFSStage1SemanticPreprocessor:
                 except Exception as exc:
                     result.update(status="failed", error=str(exc))
                 write_jsonl_atomic(self.output_manifest, existing.values())
+            self._encode_evaluation_prompt(encoder)
         finally:
             encoder.close()
+
+    def _encode_evaluation_prompt(self, encoder):
+        evaluation = getattr(self.config, "evaluation", None)
+        if not evaluation or not evaluation.get("prompt_path") or not evaluation.get("prompt_cache_path"):
+            return
+        prompt_path = require_local_path(evaluation.prompt_path, "evaluation.prompt_path")
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if not prompt:
+            raise ValueError(f"WorldScore evaluation prompt is empty: {prompt_path}")
+        cache_path = Path(evaluation.prompt_cache_path).expanduser().resolve()
+        if cache_path.is_file() and not bool(self.config.runtime.overwrite):
+            return
+        encoded = encoder.encode([prompt])
+        try:
+            from safetensors.torch import save_file
+        except ImportError as exc:
+            raise RuntimeError("safetensors is required to cache the evaluation prompt") from exc
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        save_file(
+            {
+                "prompt_embedding": encoded["embeddings"][0],
+                "prompt_mask": encoded["masks"][0],
+            },
+            str(temporary),
+        )
+        os.replace(temporary, cache_path)
+        print(f"Cached WorldScore evaluation prompt embedding: {cache_path}")

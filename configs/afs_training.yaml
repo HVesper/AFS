@@ -1,0 +1,69 @@
+method:
+  name: afs
+
+# One configuration controls semantic preprocessing and the following training run.
+data:
+  input_manifest: null
+  video_root: null
+  semantic_manifest_path: null
+  semantic_cache_root: null
+  gt_latent_mode: precomputed
+  gt_latent_cache_root: null
+
+self_forcing:
+  config_path: null
+
+model:
+  backend: self_forcing
+  wan_model_path: null
+  self_forcing_checkpoint_path: null
+  train_mode: lora
+
+qwen3_vl:
+  model_path: null
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: flash_attention_2
+  max_new_tokens: 96
+  video_fps: 16
+
+text_encoder:
+  backend: self_forcing_umt5
+  model_path: null
+  dtype: bfloat16
+
+chunking:
+  inherit_from_self_forcing: true
+  target_fps: null
+  target_frame_count: null
+  vae_temporal_compression_ratio: null
+
+teacher:
+  type: ema
+  text_condition_mode: chunk_replace
+  use_gt_assisted_visual_cache: true
+  ema_decay: null
+
+training:
+  max_steps: 300
+  save_interval_steps: 300
+  max_checkpoints: 0
+  shared_prefix_chunks: 1
+  detach_rollout_transition: true
+  dense_velocity_matching: true
+  train_num_latent_frames: 240
+  eval_interval_steps: 0
+  eval_num_samples: 2
+  eval_num_latent_frames: 243
+  eval_seed: 12345
+  eval_prompt_path: null
+  eval_prompt_cache_path: null
+
+runtime:
+  semantic_resume: true
+  semantic_overwrite: false
+  semantic_wait_timeout_sec: 86400
+  semantic_poll_interval_sec: 10
+  training_resume: true
+  output_dir: null
+  mixed_precision: bf16

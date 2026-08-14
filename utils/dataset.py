@@ -129,7 +129,11 @@ class InferencePromptEmbedsVideoLMDBDataset(Dataset):
         return batch
 
 
-def cycle(dl):
+def cycle(dl, sampler=None, start_epoch=0):
+    epoch = int(start_epoch)
     while True:
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         for data in dl:
             yield data
+        epoch += 1

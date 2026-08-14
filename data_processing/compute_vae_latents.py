@@ -54,10 +54,12 @@ def _load_video_tensor(video_pt_path: str) -> torch.Tensor:
     else:
         raise ValueError(f"Cannot infer channel dimension from shape {tuple(video.shape)} in {video_pt_path}")
 
-    video = video.float()
-    if video.max() > 1.5:
-        video = video / 255.0
-    if video.min() >= 0.0 and video.max() <= 1.0:
+    value_min = float(video.min())
+    value_max = float(video.max())
+    if not video.is_floating_point() or value_max > 1.5:
+        video = video.float() / 255.0
+        value_min, value_max = 0.0, 1.0
+    if value_min >= 0.0 and value_max <= 1.0:
         video = video * 2.0 - 1.0
     return video
 
@@ -68,6 +70,12 @@ def main() -> None:
     parser.add_argument("--output_latent_folder", type=Path, required=True)
     parser.add_argument("--model_root", type=str, default=None, help="Optional Wan2.1-T2V-1.3B path.")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--afs_chunk_size",
+        type=int,
+        default=0,
+        help="When positive, write sample.safetensors with gt_chunk_latents [N,C,T,H,W].",
+    )
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -86,12 +94,24 @@ def main() -> None:
     local_files = files[rank::world_size]
     for video_pt_path in tqdm(local_files, desc=f"VAE rank {rank}", disable=rank != 0):
         sample_id = Path(video_pt_path).name.replace("_video.pt", "")
-        output_path = args.output_latent_folder / f"{sample_id}_latent.pt"
+        output_path = args.output_latent_folder / (
+            f"{sample_id}.safetensors" if args.afs_chunk_size > 0 else f"{sample_id}_latent.pt"
+        )
         if args.resume and output_path.exists():
             continue
         video = _load_video_tensor(video_pt_path).to(device=device, dtype=torch.bfloat16)
         latent = model.encode_to_latent(video).cpu().half()  # [1, T, 16, H, W]
-        torch.save(latent, output_path)
+        if args.afs_chunk_size > 0:
+            from safetensors.torch import save_file
+            latent = latent.squeeze(0)
+            usable_frames = (latent.shape[0] // args.afs_chunk_size) * args.afs_chunk_size
+            if usable_frames <= 0:
+                raise ValueError(f"Latent for {sample_id} is shorter than one AFS chunk")
+            latent = latent[:usable_frames]
+            chunks = latent.unflatten(0, (-1, args.afs_chunk_size)).permute(0, 2, 1, 3, 4).contiguous()
+            save_file({"gt_chunk_latents": chunks}, str(output_path))
+        else:
+            torch.save(latent, output_path)
         del video, latent
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

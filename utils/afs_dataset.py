@@ -5,21 +5,24 @@ import torch
 from torch.utils.data import Dataset
 
 
-class AFSStage2Dataset(Dataset):
-    """Local-only adapter joining Stage 1 caches with precomputed GT latents."""
+class AFSTrainingDataset(Dataset):
+    """Local-only adapter joining semantic preprocessing caches with precomputed GT latents."""
 
-    def __init__(self, manifest_path: str, gt_latent_cache_root: str):
+    def __init__(self, manifest_path: str, gt_latent_cache_root: str, split: str = "train"):
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         self.latent_root = Path(gt_latent_cache_root).expanduser().resolve()
         if not self.manifest_path.is_file():
-            raise FileNotFoundError(f"AFS Stage 1 manifest does not exist: {self.manifest_path}")
+            raise FileNotFoundError(f"AFS semantic preprocessing manifest does not exist: {self.manifest_path}")
         if not self.latent_root.is_dir():
             raise FileNotFoundError(f"AFS GT latent cache root does not exist: {self.latent_root}")
         with self.manifest_path.open("r", encoding="utf-8") as handle:
             self.records = [json.loads(line) for line in handle if line.strip()]
-        self.records = [record for record in self.records if record.get("status") == "complete"]
+        self.records = [
+            record for record in self.records
+            if record.get("status") == "complete" and record.get("split", "train") == split
+        ]
         if not self.records:
-            raise ValueError("AFS Stage 1 manifest contains no complete samples")
+            raise ValueError(f"AFS semantic preprocessing manifest contains no complete {split} samples")
 
     def __len__(self):
         return len(self.records)
@@ -32,7 +35,7 @@ class AFSStage2Dataset(Dataset):
         try:
             from safetensors.torch import load_file
         except ImportError as exc:
-            raise RuntimeError("safetensors is required to read AFS Stage 1 caches") from exc
+            raise RuntimeError("safetensors is required to read AFS semantic preprocessing caches") from exc
         semantic = load_file(str(semantic_path), device="cpu")
         latent_path = self.latent_root / f"{record['sample_id']}.safetensors"
         if not latent_path.is_file():

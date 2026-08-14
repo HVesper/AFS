@@ -1,7 +1,9 @@
 torch>=2.5.0
 torchvision>=0.20.0
 diffusers==0.31.0
-transformers>=4.49.0
+transformers>=4.57.0
+qwen-vl-utils>=0.0.14
+av>=12.0.0
 tokenizers>=0.20.3
 accelerate>=1.1.1
 peft>=0.14.0
@@ -20,3 +22,4 @@ imageio-ffmpeg>=0.5.1
 packaging>=24.0
 safetensors>=0.4.5
 huggingface_hub>=0.27.0
+yt-dlp>=2025.6.30
